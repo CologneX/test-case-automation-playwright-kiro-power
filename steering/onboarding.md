@@ -11,9 +11,11 @@ Read only on first use, or when a scaffold file is missing. Copy code blocks exa
 ## Step 2: Install dependencies
 
 ```bash
-bun add -d @playwright/test csv-parse @types/node
+bun add -d @playwright/test csv-parse @types/node @aws/bedrock-token-generator
 bunx playwright install chromium
 ```
+
+`@aws/bedrock-token-generator` is used only by the optional post-run describe step (`describe.md`). Tests never import it.
 
 ## Step 3: Locate the CSV
 
@@ -59,9 +61,9 @@ export default defineConfig({
   use: {
     baseURL: process.env.BASE_URL,
     locale: 'en-US',
-    trace: 'on-first-retry',
-    screenshot: 'only-on-failure',
-    video: 'off',
+    trace: 'on',
+    screenshot: 'on',
+    video: 'on',
   },
   projects: [
     // One setup project per role: signs in once and saves .auth/<role>.json.
@@ -69,7 +71,7 @@ export default defineConfig({
       name: `setup-${role.slug}`,
       testMatch: /auth\.setup\.ts$/,
       metadata: { role },
-      use: { ...devices['Desktop Chrome'] },
+      use: { ...devices['Desktop Chrome'], trace: 'off' as const, screenshot: 'off' as const, video: 'off' as const },
     })),
     // One test project per role: reuses the saved session and runs only tests tagged with that role.
     ...roles.map((role) => ({
@@ -218,13 +220,305 @@ export function runDir(): string {
 }
 ```
 
-`tests/support/results-reporter.ts` (plain reporter, no AI; writes `reports/<run>/results.csv`, `results.json`, `summary.html`, and `reports/index.html`):
+`tests/support/error-text.ts` (turns Playwright errors into one plain sentence for the report; rule-based, no AI):
+```ts
+// Turns Playwright error messages into one plain sentence for the report, for example
+//   "Button matching /^Edit/ not found – could not click it (waited 10 s)".
+// Only what the page shows or lacks is stated; nothing here knows what it means for the product.
+// Unknown message shapes fall back to the first lines of the original text (see describeErrors).
 
+const ANSI = /\u001b\[[0-9;]*m/g;
+
+type Call = { name: string; args: string };
+
+// Splits "getByRole('cell', {...}).locator('x').first()" into its calls, honouring quotes and nested parentheses.
+function parseChain(expr: string): Call[] | null {
+  const calls: Call[] = [];
+  let i = 0;
+  while (i < expr.length) {
+    const m = /^\.?([A-Za-z]+)\(/.exec(expr.slice(i));
+    if (!m) return null;
+    const start = i + m[0].length;
+    let depth = 1;
+    let quote: string | null = null;
+    let j = start;
+    for (; j < expr.length && depth > 0; j++) {
+      const c = expr[j];
+      if (quote) {
+        if (c === '\\') j++;
+        else if (c === quote) quote = null;
+      } else if (c === "'" || c === '"' || c === '`') quote = c;
+      else if (c === '(') depth++;
+      else if (c === ')') depth--;
+    }
+    if (depth !== 0) return null;
+    calls.push({ name: m[1], args: expr.slice(start, j - 1) });
+    i = j;
+  }
+  return calls.length ? calls : null;
+}
+
+const ROLE_WORDS: Record<string, string> = {
+  textbox: 'text box',
+  searchbox: 'search box',
+  combobox: 'dropdown',
+  columnheader: 'column header',
+  rowheader: 'row header',
+  listbox: 'list',
+  menuitem: 'menu item',
+  spinbutton: 'number field',
+};
+
+const STRING_OR_REGEX = String.raw`(?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|(\/(?:[^\/\\]|\\.)+\/[a-z]*))`;
+
+function firstArg(args: string): string | null {
+  const m = new RegExp(`^\\s*${STRING_OR_REGEX}`).exec(args);
+  return m ? (m[1] ?? m[2] ?? m[3] ?? null) : null;
+}
+
+function quoted(args: string): string {
+  const m = new RegExp(`^\\s*${STRING_OR_REGEX}`).exec(args);
+  if (!m) return '';
+  return m[3] ? `matching ${shorten(m[3])}` : `"${shorten(m[1] ?? m[2] ?? '')}"`;
+}
+
+function shorten(text: string, max = 70): string {
+  const t = text.replace(/\\(.)/g, '$1');
+  return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+}
+
+// "getByRole('button', { name: 'Edit documentation' })" -> 'button "Edit documentation"'
+export function describeLocator(expr: string): string {
+  const calls = parseChain(expr.trim());
+  if (!calls) return shorten(expr.trim(), 90);
+  const parts: string[] = [];
+  for (const call of calls) {
+    const { name, args } = call;
+    if (name === 'getByRole') {
+      const role = firstArg(args) ?? 'element';
+      const word = ROLE_WORDS[role] ?? role;
+      const nameMatch = new RegExp(`name:\\s*${STRING_OR_REGEX}`).exec(args);
+      const label = nameMatch ? (nameMatch[3] ? `matching ${shorten(nameMatch[3])}` : `"${shorten(nameMatch[1] ?? nameMatch[2] ?? '')}"`) : '';
+      parts.push(label ? `${word} ${label}` : word);
+    } else if (name === 'getByText') parts.push(`text ${quoted(args)}`);
+    else if (name === 'getByLabel') parts.push(`field labelled ${quoted(args)}`);
+    else if (name === 'getByPlaceholder') parts.push(`field with placeholder ${quoted(args)}`);
+    else if (name === 'getByTestId') parts.push(`element with test id ${quoted(args)}`);
+    else if (name === 'getByAltText' || name === 'getByTitle') parts.push(`element ${quoted(args)}`);
+    else if (name === 'locator') {
+      const sel = firstArg(args) ?? '';
+      if (/following-sibling::(td|\*)\[1\]/.test(sel)) parts.push('next cell');
+      else parts.push(`element ${shorten(sel, 50)}`);
+    } else if (name === 'nth') parts.push(`item ${args.trim()}`);
+    // filter(...), first() and last() change which element is chosen but add nothing worth reading.
+  }
+  // A bare "table" container only adds noise when something more specific is inside it.
+  if (parts.length > 1 && parts[0] === 'table') parts.shift();
+  if (!parts.length) return shorten(expr.trim(), 90);
+  // Merge "<x>" + "next cell" into "cell next to <x>".
+  const merged: string[] = [];
+  for (const part of parts) {
+    if (part === 'next cell' && merged.length) merged.push(`cell next to ${merged.pop()}`);
+    else merged.push(part);
+  }
+  return merged.reverse().join(' in ');
+}
+
+const capital = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
+const seconds = (ms: string | number) => `${Math.round(Number(ms) / 100) / 10} s`.replace(/\.0 s$/, ' s');
+
+const ACTION_TEXT: Record<string, string> = {
+  click: 'click it',
+  dblclick: 'double-click it',
+  fill: 'type into it',
+  type: 'type into it',
+  pressSequentially: 'type into it',
+  press: 'press a key on it',
+  check: 'tick it',
+  uncheck: 'untick it',
+  setChecked: 'tick it',
+  selectOption: 'pick an option in it',
+  hover: 'hover over it',
+  focus: 'focus it',
+  clear: 'clear it',
+  setInputFiles: 'upload a file to it',
+  dispatchEvent: 'use it',
+  scrollIntoViewIfNeeded: 'scroll to it',
+  textContent: 'read it',
+  innerText: 'read it',
+  inputValue: 'read it',
+  getAttribute: 'read it',
+  ariaSnapshot: 'read it',
+};
+
+function actionError(message: string): string | null {
+  const head = /(locator|page)\.(\w+): (?:Test timeout of (\d+)ms exceeded|Timeout (\d+)ms exceeded)/.exec(message);
+  if (!head) return null;
+  const [, target, action, testLimit, explicit] = head;
+  const limit = testLimit
+    ? `test time limit of ${seconds(testLimit)} ran out`
+    : `waited ${seconds(explicit)}`;
+
+  if (target === 'page' && action === 'goto') {
+    const url = /navigating to "([^"]+)"/.exec(message)?.[1] ?? '';
+    return `Page did not finish loading${url ? `: ${url}` : ''} (${limit})`;
+  }
+  if (target === 'page' && action === 'waitForURL') return `Page did not reach the expected address (${limit})`;
+
+  const waiting = /^\s*-\s*waiting for (?!navigation)(.+)$/m.exec(message)?.[1]?.trim();
+  if (!waiting) return null;
+  // Playwright prints "waiting for locator(...)" or "waiting for getByRole(...)".
+  const desc = describeLocator(waiting.replace(/^locator\(['"]?(.*?)['"]?\)$/, '$1'));
+
+  if (action === 'waitFor') return `${capital(desc)} did not appear (${limit})`;
+
+  const found = /locator resolved to/.test(message);
+  if (found) {
+    const reasons = [...message.matchAll(/^\s*-\s*element (is not (?:visible|enabled|editable|stable|attached)|intercepts pointer events|is outside of the viewport)/gm)];
+    const reason = reasons.length ? reasons[reasons.length - 1][1] : '';
+    const why = reason
+      ? `found but ${reason.replace(/^is /, '').replace('intercepts pointer events', 'blocked by another element')}`
+      : 'found but did not become usable';
+    return `${capital(desc)} ${why} – could not ${ACTION_TEXT[action] ?? 'use it'} (${limit})`;
+  }
+  return `${capital(desc)} not found – could not ${ACTION_TEXT[action] ?? `run ${action} on it`} (${limit})`;
+}
+
+function expectError(message: string): string | null {
+  const header = /expect\(\w+\)\.(not\.)?(\w+)\(/.exec(message);
+  const locatorLine = /^\s*Locator:\s*(.+)$/m.exec(message)?.[1];
+  const expected = /^\s*Expected(?: string| pattern| value)?:\s*(.+)$/m.exec(message)?.[1]?.trim();
+  const received = /^\s*Received(?: string| value| pattern)?:\s*(.+)$/m.exec(message)?.[1]?.trim();
+  const timeout = /^\s*Timeout:\s*(\d+)ms/m.exec(message)?.[1];
+  const wait = timeout ? ` (waited ${seconds(timeout)})` : '';
+
+  // A message written into the test, expect(locator, 'message'), becomes the first line of the error, above
+  // Playwright's own "expect(locator).toX() failed" line. It states the meaning, so it is shown as written;
+  // expected/got is appended only when the page showed a different value (not when the element is missing).
+  const firstLine = message.split('\n')[0].replace(/^Error:\s*/, '').trim();
+  const custom = firstLine && !/^expect\(/.test(firstLine) && !/^(locator|page)\.\w+:/.test(firstLine) ? firstLine : '';
+  if (custom && (header || locatorLine)) {
+    const missing = /element\(s\) not found/.test(message);
+    const hasValues = expected !== undefined && received !== undefined && !missing;
+    return hasValues ? `${custom} (expected ${expected}, got ${received})` : custom;
+  }
+  if (!header) return null;
+  const negated = !!header[1];
+  const matcher = header[2];
+
+  if (/strict mode violation/.test(message)) {
+    const n = /resolved to (\d+) elements/.exec(message)?.[1];
+    const expr = /strict mode violation: (.+?) resolved to/s.exec(message)?.[1]?.replace(/\s+/g, ' ');
+    return `${capital(describeLocator(expr ?? locatorLine ?? ''))} matches ${n ?? 'several'} elements, expected exactly one`;
+  }
+
+  // toHaveURL / toHaveTitle have no locator.
+  if (!locatorLine) {
+    if (matcher === 'toHaveURL') return `Page address is ${received ?? 'different'}, expected ${expected ?? 'another address'}${wait}`;
+    if (matcher === 'toHaveTitle') return `Page title is ${received ?? 'different'}, expected ${expected ?? 'another title'}${wait}`;
+    return null;
+  }
+
+  const desc = capital(describeLocator(locatorLine));
+  if (/element\(s\) not found/.test(message) && !negated) return `${desc} not found${wait}`;
+  if (matcher === 'toBeVisible') {
+    return negated ? `${desc} is still visible${wait}` : `${desc} is not visible${wait}`;
+  }
+  if (matcher === 'toHaveCount') {
+    const want = expected ?? '?';
+    const got = received ?? '?';
+    return want === '0' ? `${desc}: expected none, found ${got}${wait}` : `${desc}: expected ${want}, found ${got}${wait}`;
+  }
+  if (expected !== undefined && received !== undefined) {
+    return `${desc}: expected ${negated ? 'not ' : ''}${expected}, got ${received}${wait}`;
+  }
+  return `${desc}: ${matcher} check failed${wait}`;
+}
+
+function otherError(message: string): string | null {
+  const net = /net::(ERR_[A-Z_]+)/.exec(message)?.[1];
+  if (net) return `Network error while loading the page (${net})`;
+  if (/Target (page, context or browser|closed)|has been closed/.test(message)) return 'The browser or page was closed during the test';
+  return null;
+}
+
+function genericTimeout(message: string): string | null {
+  const m = /^\s*(?:Error: )?Test timeout of (\d+)ms exceeded\.?\s*$/m.exec(message);
+  return m ? `Test ran out of time (limit ${seconds(m[1])})` : null;
+}
+
+const firstLines = (message: string) =>
+  message.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 3).join(' | ').slice(0, 500);
+
+// messages: every error of the last attempt, in order. Returns one sentence per distinct error, joined with "; ".
+export function describeErrors(messages: string[]): string {
+  const cleaned = messages.map((m) => m.replace(ANSI, ''));
+  const sentences: string[] = [];
+  let timeoutOnly: string | null = null;
+  for (const message of cleaned) {
+    const specific = actionError(message) ?? expectError(message) ?? otherError(message);
+    if (specific) {
+      if (!sentences.includes(specific)) sentences.push(specific);
+      continue;
+    }
+    const plain = genericTimeout(message);
+    if (plain) timeoutOnly = plain;
+    else {
+      const raw = firstLines(message);
+      if (raw && !sentences.includes(raw)) sentences.push(raw);
+    }
+  }
+  // "Test timeout" is the symptom when a later error already names the missing element.
+  if (!sentences.length && timeoutOnly) sentences.push(timeoutOnly);
+  return sentences.slice(0, 3).join('; ');
+}
+```
+`tests/support/error-cell.ts` (renders the error cell of a failed row in `summary.html`; shared by the reporter and `describe-failures.ts`):
+```ts
+// The "error" cell of a failed row in summary.html, shared by the reporter (rule-based text) and by
+// describe-failures.ts (which swaps in the AI description). Markers let the describe step replace exactly one cell.
+//
+//   visible:    AI description when there is one, otherwise the rule-based sentence (error-text.ts)
+//   collapsed:  "technical error" = the rule-based sentence (when the AI text is shown) and the original Playwright error
+
+export type ErrorCellRow = {
+  error: string;
+  technicalError?: string;
+  aiDescription?: string;
+  aiModel?: string;
+};
+
+const esc = (v: string) => v.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+
+export function renderErrorCell(row: ErrorCellRow, index: number): string {
+  const ai = row.aiDescription?.trim();
+  let main = '';
+  if (ai) {
+    main = `<div class="ai-description"><b>AI description</b> <small>(${esc(row.aiModel ?? 'AI')}, may be inaccurate)</small><br>${esc(ai)}</div>`;
+  } else if (row.error) {
+    main = `<code>${esc(row.error)}</code>`;
+  }
+  const technical: string[] = [];
+  if (ai && row.error) technical.push(`<div><b>Summary</b> <code>${esc(row.error)}</code></div>`);
+  if (row.technicalError) technical.push(`<div><b>Playwright error</b> <code>${esc(row.technicalError)}</code></div>`);
+  const details = technical.length ? `<details><summary>technical error</summary>${technical.join('')}</details>` : '';
+  return `<!--err:${index}-->${main}${details}<!--/err:${index}-->`;
+}
+
+// Replaces the cell of row `index` in an existing summary.html. Returns null when the run has no markers (older run).
+export function replaceErrorCell(html: string, row: ErrorCellRow, index: number): string | null {
+  const re = new RegExp(`<!--err:${index}-->[\\s\\S]*?<!--/err:${index}-->`);
+  return re.test(html) ? html.replace(re, () => renderErrorCell(row, index)) : null;
+}
+```
+`tests/support/results-reporter.ts` (plain reporter, no AI; writes `reports/<run>/results.csv`, `results.json`, `summary.html`, and `reports/index.html`):
 ```ts
 import fs from 'node:fs';
 import path from 'node:path';
 import type { FullConfig, FullResult, Reporter, Suite, TestCase } from '@playwright/test/reporter';
 import { csvPath, readCsvRows, slugify, splitRoles } from './roles';
+import { describeErrors } from './error-text';
+import { renderErrorCell } from './error-cell';
 
 // Plain reporter, no AI. Writes one row per CSV test case and role:
 // <outputDir>/results.csv, results.json, summary.html
@@ -242,9 +536,13 @@ type ResultRow = {
   retries: number;
   failedAt: string;
   error: string;
+  technicalError: string;
+  aiDescription?: string;
+  aiModel?: string;
   specFile: string;
   trace: string;
   screenshot: string;
+  video: string;
   testId: string;
 };
 
@@ -306,7 +604,7 @@ export default class ResultsReporter implements Reporter {
       const [testCaseId, ...rest] = test.title.trim().split(/\s+/);
       const csv = csvRows.get(testCaseId);
       const last = test.results.at(-1);
-      const { error, failedAt } = this.errorOf(test);
+      const { error, technicalError, failedAt } = this.errorOf(test);
       rows.push({
         testCaseId,
         scenario: csv?.scenario ?? rest.join(' '),
@@ -317,9 +615,11 @@ export default class ResultsReporter implements Reporter {
         retries: Math.max(test.results.length - 1, 0),
         failedAt,
         error,
+        technicalError,
         specFile: path.relative(this.rootDir, test.location.file),
         trace: this.attachment(last?.attachments, 'trace'),
         screenshot: this.attachment(last?.attachments, 'screenshot'),
+        video: this.attachment(last?.attachments, 'video'),
         testId: test.id,
       });
     }
@@ -346,8 +646,8 @@ export default class ResultsReporter implements Reporter {
           : fs.existsSync(path.resolve(this.rootDir, spec)) ? 'not run' : 'not automated';
         rows.push({
           testCaseId: id, scenario: csv.scenario, expectedResult: csv.expected, role: role.name, status,
-          durationMs: 0, retries: 0, failedAt: '', error: '', specFile: status === 'not run' ? spec : '',
-          trace: '', screenshot: '', testId: '',
+          durationMs: 0, retries: 0, failedAt: '', error: '', technicalError: '', specFile: status === 'not run' ? spec : '',
+          trace: '', screenshot: '', video: '', testId: '',
         });
       }
     }
@@ -445,12 +745,20 @@ ${rows}
   private errorOf(test: TestCase) {
     const last = test.results.at(-1);
     const first = last?.errors[0];
-    if (!first || test.outcome() === 'expected' || test.outcome() === 'flaky') return { error: '', failedAt: '' };
+    if (!first || test.outcome() === 'expected' || test.outcome() === 'flaky') return { error: '', technicalError: '', failedAt: '' };
     const message = redact((first.message ?? first.value ?? '').replace(ANSI, ''));
-    const error = message.split('\n').filter((l) => l.trim()).slice(0, 3).join(' | ').slice(0, 500);
+    // Original Playwright text, kept for the "technical error" column.
+    // A timeout names the missing element only in a later error, so every error contributes its first lines.
+    const technicalError = (last?.errors ?? [first])
+      .map((e) => redact((e.message ?? e.value ?? '').replace(ANSI, '')).split('\n').filter((l) => l.trim()).slice(0, 3).join(' | '))
+      .filter(Boolean)
+      .join(' || ')
+      .slice(0, 700);
+    // Plain sentence from every error of the last attempt (a timeout names the missing element in a later error).
+    const readable = describeErrors((last?.errors ?? []).map((e) => redact(e.message ?? e.value ?? '')));
     // Timeouts put the step location on a later error.
     const location = last?.errors.find((e) => e.location)?.location;
-    return { error, failedAt: location ? this.stepAt(location.file, location.line) : '' };
+    return { error: (readable || technicalError).slice(0, 500), technicalError, failedAt: location ? this.stepAt(location.file, location.line) : '' };
   }
 
   // Nearest "// A<n>. ..." or "// <n>. ..." comment above the failing line (see test-conventions.md).
@@ -505,12 +813,12 @@ ${rows}
       ? `<div class="alert"><b>Sign-in setup failed:</b><ul>${report.authFailures
         .map((f) => `<li>${esc(f.role)}: ${esc(f.error)}</li>`).join('')}</ul></div>`
       : '';
-    const body = report.results.map((r) => `<tr>
+    const body = report.results.map((r, i) => `<tr>
 <td><b>${esc(r.testCaseId)}</b></td><td>${esc(r.scenario)}</td><td>${esc(r.expectedResult)}</td><td>${esc(r.role)}</td>
 <td><span class="badge ${cls(r.status)}">${esc(r.status)}</span>${r.retries ? ` <small>(${r.retries} retr${r.retries > 1 ? 'ies' : 'y'})</small>` : ''}</td>
 <td class="num">${r.durationMs ? (r.durationMs / 1000).toFixed(1) + ' s' : ''}</td>
-<td>${r.failedAt ? `<b>${esc(r.failedAt)}</b><br>` : ''}${r.error ? `<code>${esc(r.error)}</code>` : ''}</td>
-<td class="links">${r.testId ? `<a href="${htmlReport}#?testId=${esc(r.testId)}">details</a>` : ''}${r.screenshot ? ` <a href="${link(r.screenshot)}">screenshot</a>` : ''}</td>
+<td>${r.failedAt ? `<b>${esc(r.failedAt)}</b><br>` : ''}${renderErrorCell(r, i)}</td>
+<td class="links">${r.testId ? `<a href="${htmlReport}#?testId=${esc(r.testId)}">details</a>` : ''}${r.screenshot ? ` <a href="${link(r.screenshot)}">screenshot</a>` : ''}${r.video ? ` <a href="${link(r.video)}">video</a>` : ''}</td>
 </tr>`).join('\n');
     return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -567,16 +875,265 @@ function redact(text: string) {
 
 function toCsv(rows: ResultRow[]) {
   const header = ['test case id', 'test scenario', 'expected result', 'role', 'status', 'duration (s)', 'retries',
-    'failed at', 'error', 'spec file', 'trace', 'screenshot'];
+    'failed at', 'error', 'spec file', 'trace', 'screenshot', 'video', 'technical error', 'description by'];
   const quote = (v: string | number) => `"${String(v).replace(/"/g, '""')}"`;
   const lines = rows.map((r) => [r.testCaseId, r.scenario, r.expectedResult, r.role, r.status,
-  r.durationMs ? (r.durationMs / 1000).toFixed(1) : '', r.retries, r.failedAt, r.error, r.specFile, r.trace, r.screenshot]
+  r.durationMs ? (r.durationMs / 1000).toFixed(1) : '', r.retries, r.failedAt, r.aiDescription || r.error, r.specFile, r.trace, r.screenshot, r.video, r.technicalError,
+    r.error || r.aiDescription ? (r.aiDescription ? (r.aiModel ?? 'AI') : 'rules') : '']
     .map(quote).join(','));
   // BOM so Excel opens UTF-8 correctly.
   return '\uFEFF' + [header.map(quote).join(','), ...lines].join('\r\n') + '\r\n';
 }
 ```
+`tests/support/describe-failures.ts` (optional post-run step, never run by `playwright test`; see `describe.md`. Needs `@aws/bedrock-token-generator`):
+```ts
+// Post-run step (never part of a test run): asks Gemma 4 E2B on Amazon Bedrock to describe each failed test in plain
+// words and adds the text to a run folder as an "AI description".
+//
+//   bun run describe                                 latest run in reports/
+//   bun run describe -- reports/<run>                a given run
+//   bun run describe -- --profile <name>             AWS profile to use (or set DESCRIBE_AWS_PROFILE in .env)
+//   bun run describe -- --region us-west-2           Bedrock region (or set DESCRIBE_REGION in .env), default us-east-1
+//   bun run describe -- --force                      describe rows that already have an AI description
+//   bun run describe -- --dry-run                    print what would be sent, call nothing (no profile needed)
+//
+// AWS profile (required): the profile is never guessed. Set DESCRIBE_AWS_PROFILE in .env or pass --profile <name>.
+// Without one the script stops before sending anything; ask the agent which profile to use.
+// Region: Gemma 4 E2B is served in us-east-1, us-east-2, us-west-2 and eu-central-1 (not ap-southeast-1). The short-term
+// token is only valid in the region it was made for.
+// Permissions of the profile: bedrock-mantle:CreateInference and bedrock-mantle:CallWithBearerToken
+// (managed policy AmazonBedrockMantleInferenceAccess).
+//
+// Files changed in the run folder: results.json (aiDescription, aiModel), results.csv (the "error" column becomes the AI
+// description and "description by" names the model), summary.html (the AI description is the visible text; the rule-based
+// sentence and the original Playwright error move into the collapsed "technical error"). Pass/fail is never touched.
+//
+// Sent to the model: test case id, scenario, expected result, role, failing step, the report's error text and the
+// clarification notes of the spec. Not sent: screenshots, traces, page content, .env or credentials.
+// Auth: the credentials of the chosen profile, turned into a short-term (15 min) Bedrock bearer token for one region.
+// Docs: https://docs.aws.amazon.com/bedrock/latest/userguide/model-card-google-gemma-4-e2b.html
+import fs from 'node:fs';
+import path from 'node:path';
+import { parse } from 'csv-parse/sync';
+import { getTokenProvider } from '@aws/bedrock-token-generator';
+import { replaceErrorCell } from './error-cell';
 
+// Same .env as playwright.config.ts. Bun already loads .env on its own and has no process.loadEnvFile; Node needs the call.
+if (fs.existsSync('.env') && typeof process.loadEnvFile === 'function') process.loadEnvFile('.env');
+
+const MODEL = 'google.gemma-4-e2b';
+const FAILED = new Set(['failed', 'timed out', 'interrupted']);
+
+type Row = {
+  testCaseId: string;
+  scenario: string;
+  expectedResult: string;
+  role: string;
+  status: string;
+  failedAt: string;
+  error: string;
+  technicalError?: string;
+  aiDescription?: string;
+  aiModel?: string;
+};
+
+const args = process.argv.slice(2);
+const flag = (name: string) => args.includes(name);
+const option = (name: string) => {
+  const i = args.indexOf(name);
+  const value = i >= 0 ? args[i + 1] : undefined;
+  return value && !value.startsWith('--') ? value : undefined;
+};
+const OPTIONS_WITH_VALUE = ['--region', '--profile'];
+const REGION = option('--region') || process.env.DESCRIBE_REGION || 'us-east-1'; // us-east-1 is a supported region
+const PROFILE = (option('--profile') || process.env.DESCRIBE_AWS_PROFILE || '').trim();
+const positional = args.filter((a, i) => !a.startsWith('--') && !OPTIONS_WITH_VALUE.includes(args[i - 1]));
+
+function latestRun(): string {
+  const dirs = fs.existsSync('reports')
+    ? fs.readdirSync('reports').filter((n) => /^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(-\d+)?$/.test(n) && fs.existsSync(path.join('reports', n, 'results.json'))).sort()
+    : [];
+  if (!dirs.length) throw new Error('No run folder with results.json under reports/. Run the tests first.');
+  return path.join('reports', dirs[dirs.length - 1]);
+}
+
+// Spec notes that explain what the test case expects (owner decisions), without steps or data.
+function specNotes(testCaseId: string): string {
+  const file = path.join('specs', `${testCaseId}.md`);
+  if (!fs.existsSync(file)) return '';
+  return fs
+    .readFileSync(file, 'utf8')
+    .split('\n')
+    .filter((l) => /^- Clarification applied:/.test(l))
+    .map((l) => l.replace(/^- Clarification applied:\s*/, '- '))
+    .join('\n')
+    .slice(0, 1500);
+}
+
+const SYSTEM = `You write short notes for a software tester who reads an automated test report.
+You get one failed test: what it should check, the step where it stopped, and the error text.
+Write 2 or 3 plain sentences, no markdown, no bullet points, no code:
+1. What the test was doing and what it expected.
+2. What happened instead, using only facts in the error text.
+Rules: do not guess the cause, do not say whether it is a product defect or a test problem, do not invent screen details.
+If the notes mention an owner decision (like C-3), you may name it once. Keep field and button names exactly as given.
+In "expected X, got Y" the test expected X and the page showed Y.
+Example 1: "The test tried to type a new value into 'Redemption Amount (MYR)' on the Documentation edit page, as the test case expects the field to be editable. It could not find a text box for that field, so the test ran out of time and the later checks did not run."
+Example 2: "The test entered a new 'New Redemption Amount (MYR)' of 90000.00 and expected the page to show it. The page still showed 80000, both on the edit page and on the summary after saving."`;
+
+function userPrompt(r: Row): string {
+  return [
+    `Test case: ${r.testCaseId} ${r.scenario}`,
+    `Role: ${r.role}`,
+    `Expected result (from the test case): ${r.expectedResult}`,
+    `Step where it stopped: ${r.failedAt || 'unknown'}`,
+    `Result: ${r.status}`,
+    `Error text from the report: ${r.error}`,
+    specNotes(r.testCaseId) ? `Notes on this test case:\n${specNotes(r.testCaseId)}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+async function ask(token: string, prompt: string, maxTokens: number): Promise<{ text?: string; note?: string }> {
+  const res = await fetch(`https://bedrock-mantle.${REGION}.api.aws/openai/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      model: MODEL,
+      messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: prompt }],
+      // Reasoning tokens count against max_tokens; "high" keeps the reasoning out of the answer text (model card).
+      reasoning_effort: 'high',
+      max_tokens: maxTokens,
+      temperature: 0.2,
+    }),
+    signal: AbortSignal.timeout(90_000),
+  });
+  if (!res.ok) return { note: `HTTP ${res.status}: ${(await res.text()).slice(0, 200)}` };
+  const body = (await res.json()) as { choices?: { finish_reason?: string; message?: { content?: string | null } }[] };
+  const choice = body.choices?.[0];
+  const text = choice?.message?.content?.trim();
+  if (text) return { text };
+  return { note: choice?.finish_reason === 'length' ? 'length' : 'empty reply' };
+}
+
+async function describe(token: string, row: Row): Promise<string | undefined> {
+  const prompt = userPrompt(row);
+  for (const maxTokens of [3000, 8000]) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const { text, note } = await ask(token, prompt, maxTokens);
+        if (text) return text.replace(/\s+/g, ' ').replace(/[*_`#]/g, '');
+        if (note === 'length') break; // reasoning used the whole budget: retry once with a larger one
+        if (attempt === 0 && /HTTP (429|5\d\d)/.test(note ?? '')) continue;
+        console.warn(`  ${row.testCaseId} ${row.role}: ${note}`);
+        return undefined;
+      } catch (e) {
+        if (attempt === 1) {
+          console.warn(`  ${row.testCaseId} ${row.role}: ${e instanceof Error ? e.message : e}`);
+          return undefined;
+        }
+      }
+    }
+  }
+  console.warn(`  ${row.testCaseId} ${row.role}: no answer within the token budget`);
+  return undefined;
+}
+
+// results.csv rows are written in the same order as results.json, so row i of one is row i of the other.
+// The "error" column holds the AI description when there is one (the rule-based sentence stays in results.json and
+// in the collapsed technical details of summary.html); "description by" says which one it is.
+function patchCsv(file: string, rows: Row[]) {
+  const records = parse(fs.readFileSync(file), { bom: true, relax_column_count: true }) as string[][];
+  const header = records[0];
+  const col = (name: string) => {
+    let i = header.indexOf(name);
+    if (i < 0) {
+      header.push(name);
+      i = header.length - 1;
+    }
+    return i;
+  };
+  const errorCol = col('error');
+  const byCol = col('description by');
+  records.slice(1).forEach((record, i) => {
+    const row = rows[i];
+    if (!row) return;
+    while (record.length < header.length) record.push('');
+    if (row.aiDescription) {
+      record[errorCol] = row.aiDescription;
+      record[byCol] = row.aiModel ?? MODEL;
+    }
+  });
+  const quote = (v: string) => `"${String(v).replace(/"/g, '""')}"`;
+  // BOM so Excel opens UTF-8 correctly (same as the reporter).
+  fs.writeFileSync(file, '\uFEFF' + records.map((r) => r.map(quote).join(',')).join('\r\n') + '\r\n');
+}
+
+// Swaps the error cell of every described row. Run folders from before the cell markers existed are left alone.
+function patchHtml(file: string, rows: Row[]) {
+  let html = fs.readFileSync(file, 'utf8');
+  let skipped = 0;
+  rows.forEach((row, i) => {
+    if (!row.aiDescription) return;
+    const next = replaceErrorCell(html, row, i);
+    if (next === null) skipped++;
+    else html = next;
+  });
+  if (skipped) console.warn(`  summary.html has no error-cell markers for ${skipped} row(s) (run made before this version); rerun the tests to get them.`);
+  fs.writeFileSync(file, html);
+}
+
+async function main() {
+  // No fallback to the default credential chain: the user must name the profile. A dry run sends nothing, so it is exempt.
+  if (!PROFILE && !flag('--dry-run')) {
+    throw new Error(
+      'No AWS profile set. Nothing was sent. Set DESCRIBE_AWS_PROFILE in .env (or pass --profile <name>) to the AWS profile ' +
+      'you want to use for the AI descriptions, and ask the agent which profile that should be.',
+    );
+  }
+  const run = positional[0] ?? latestRun();
+  const jsonFile = path.join(run, 'results.json');
+  const report = JSON.parse(fs.readFileSync(jsonFile, 'utf8')) as { results: Row[] };
+  const failed = report.results.filter((r) => FAILED.has(r.status));
+  console.log(`Run ${run}: ${failed.length} failed row(s). Model ${MODEL}.`);
+  console.log(`AWS profile: ${PROFILE || '(not set)'}, region: ${REGION}`);
+  if (!failed.length) return;
+
+  if (flag('--dry-run')) {
+    for (const r of failed) console.log(`\n--- ${r.testCaseId} ${r.role}\n${userPrompt(r)}`);
+    return;
+  }
+
+  console.log(`Sending the text of the failed rows (no screenshots) to Amazon Bedrock in ${REGION} with AWS profile ${PROFILE}.`);
+  let token: string;
+  try {
+    token = await getTokenProvider({ profile: PROFILE, region: REGION, expiresInSeconds: 900 })();
+  } catch (e) {
+    throw new Error(`Could not get AWS credentials for profile "${PROFILE}": ${e instanceof Error ? e.message : e}`);
+  }
+
+  let done = 0;
+  for (const row of failed) {
+    if (row.aiDescription && !flag('--force')) continue;
+    const text = await describe(token, row);
+    if (text) {
+      row.aiDescription = text;
+      row.aiModel = MODEL;
+      done++;
+      console.log(`  ${row.testCaseId} ${row.role}: ${text}`);
+    }
+  }
+
+  fs.writeFileSync(jsonFile, JSON.stringify(report, null, 2));
+  patchCsv(path.join(run, 'results.csv'), report.results);
+  patchHtml(path.join(run, 'summary.html'), report.results);
+  console.log(`Done: ${done} new description(s) written to ${run}.`);
+}
+
+main().catch((e) => {
+  console.error(e instanceof Error ? e.message : e);
+  process.exit(1);
+});
+```
 `tests/auth.setup.ts`:
 
 ```ts
@@ -688,6 +1245,9 @@ AUTH_MAX_AGE_MINUTES=45
 # One pair per role from the CSV "roles" column:
 ROLE_<SLUG>_USERNAME=
 ROLE_<SLUG>_PASSWORD=
+# Optional AI descriptions of failed tests (describe.md). Names only, never keys. Leave empty until the user chooses.
+DESCRIBE_AWS_PROFILE=
+DESCRIBE_REGION=
 ```
 
 `package.json` scripts (add if missing):
@@ -697,11 +1257,13 @@ ROLE_<SLUG>_PASSWORD=
   "scripts": {
     "test": "playwright test --grep-invert @seed",
     "test:role": "playwright test --grep-invert @seed --project",
-    "report": "playwright show-report \"reports/$(ls reports | grep '^20' | tail -1)/playwright-report\""
+    "report": "playwright show-report \"reports/$(ls reports | grep '^20' | tail -1)/playwright-report\"",
+    "describe": "bun tests/support/describe-failures.ts"
   }
 }
 ```
 
+The `describe` script is optional and needs bun at run time. Tests do not.
 Create the empty folder `specs/`.
 
 ## Step 5: Verify the scaffold
@@ -710,7 +1272,8 @@ Create the empty folder `specs/`.
 2. Ask the user to copy `.env.example` to `.env` and fill it. Wait for confirmation.
 3. Follow `microsoft-auth.md` to verify the sign-in locators and add the signed-in landmark.
 4. `bunx playwright test tests/seed.spec.ts` must pass for every role.
+5. Optional, after step 4 passes: ask the user about AI descriptions of failed tests and follow `describe.md`. Skip it if the user declines. Do not set `DESCRIBE_AWS_PROFILE` yourself.
 
 More run commands: `--only-changed=main` (specs changed vs main), `--shard=1/4` (CI).
 
-Speed defaults: `fullyParallel`, headless Chromium, sessions reused for `AUTH_MAX_AGE_MINUTES`, no video, trace only on retry, no local retries.
+Speed defaults: `fullyParallel`, headless Chromium, sessions reused for `AUTH_MAX_AGE_MINUTES`, trace, screenshot and video recorded for every test (setup projects off), no local retries.

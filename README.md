@@ -1,6 +1,6 @@
 # csv-test-automation (Kiro Power)
 
-Turns a CSV of test cases (`test case id`, `test scenario`, `expected result`, `roles`) into plain Playwright Test (TypeScript) specs. AI is used to author and heal tests only. Test runs are plain `playwright test`, parallel, with no LLM calls.
+Turns a CSV of test cases (`test case id`, `test scenario`, `expected result`, `roles`) into plain Playwright Test (TypeScript) specs. AI is used to author and heal tests only, except the optional post-run describe step. Test runs are plain `playwright test`, parallel, with no LLM calls.
 
 ```
 csv-test-automation/
@@ -14,12 +14,22 @@ csv-test-automation/
     agent-healer.md      Heal sub-agent (includes the healing rules)
     test-conventions.md  spec conventions (Generate, Heal)
     microsoft-auth.md    sign-in model and troubleshooting
-    onboarding.md        first-use steps and all scaffold code
-    results.md           results files, statuses, how to report
+    onboarding.md        first-use steps and all scaffold code (reporter, error-text, error-cell, describe script)
+    results.md           results files, CSV columns, statuses, how to report
+    describe.md          optional post-run AI descriptions of failed tests (asks the user for the AWS profile)
     refresh-agents.md    Playwright upgrade procedure
     ported-originals.md  verbatim Playwright agent text (1.64.1), read only by refresh-agents.md
 ```
 
+## Optional: AI descriptions of failed tests
+After a run, `bun run describe` asks Gemma 4 E2B on Amazon Bedrock to describe each failed row in plain words. The AI text becomes the `error` shown in `results.csv` and `summary.html`. The rule-based sentence and the Playwright error stay under "technical error". The step is opt-in, post-run, and never part of `playwright test`.
+- **Profile:** Kiro asks which AWS profile to use (it lists profile names from `aws configure list-profiles`, never reads `~/.aws` files) and which region. It never defaults to `default` or any profile you did not choose. The names go into `.env` as `DESCRIBE_AWS_PROFILE` and `DESCRIBE_REGION`. The script refuses to run without a profile.
+- **Sent to AWS:** test case id, scenario, expected result, role, failing step, the report's error sentence, and the spec's `Clarification applied` notes. Not sent: screenshots, traces, page content, `.env`, credentials. The text is processed in the chosen region (`us-east-1` default; `us-east-2`, `us-west-2`, `eu-central-1` also work; `ap-southeast-1` does not).
+- **Access:** the profile needs `bedrock-mantle:CreateInference` and `bedrock-mantle:CallWithBearerToken` (managed policy `AmazonBedrockMantleInferenceAccess`). If the login expired, run `aws sso login --profile <name>` or `aws login` yourself. Kiro never asks for keys.
+- **Caveats:** descriptions are AI-generated and may be inaccurate. Cost is per token and small. If it fails, the report is still complete.
+- **Commands:** `bun run describe -- --dry-run` (print what would be sent), `bun run describe`, `bun run describe -- reports/<run> --profile <name> --region <r> --force`.
+- **Without AI:** `error-text.ts` already turns Playwright errors into one plain sentence. For a known product finding, a message in the test, `expect(locator, 'message')`, is kept as written.
+Details: `steering/describe.md`.
 ## Install
 
 1. Open the Kiro Powers panel (Ghosty icon with the lightning bolt).
@@ -60,10 +70,11 @@ Generate ("generate approved plans")
 
 Run
 - [ ] `bun run test` passes. On a second run within `AUTH_MAX_AGE_MINUTES`, the setup steps reuse the saved sessions and skip the Microsoft sign-in.
-- [ ] `grep -rE "openai|anthropic|bedrock|mcp" tests/ playwright.config.ts` finds nothing.
+- [ ] `grep -rE "openai|anthropic|bedrock|mcp" tests/ playwright.config.ts --exclude=describe-failures.ts` finds nothing. Only the optional describe script may mention Bedrock, and no spec, fixture, or the config imports it.
 
 Results
 - [ ] Each run creates a new `reports/<YYYY-MM-DD_HH-mm-ss>/` folder with `results.csv`, `results.json`, `summary.html`, `playwright-report/`, and `test-results/`. Earlier run folders are unchanged.
+- [ ] `results.csv` has the columns `technical error` and `description by` (`rules` for rows with an error). A failed row in `summary.html` shows one plain sentence and a collapsed "technical error".
 - [ ] `reports/index.html` lists every run, newest first.
 - [ ] `bunx playwright test --last-failed` re-runs only the previous run's failures.
 - [ ] Rows 1-3 each appear once per role, with the expected result copied from the CSV.
@@ -71,6 +82,12 @@ Results
 - [ ] For a failing test, "failed at" names the `A<n>` assertion, and "details" in the summary opens that test in the Playwright report.
 - [ ] `grep -r "<a role password>" reports/` finds nothing.
 
+Describe (optional; skip if you do not want AI descriptions)
+- [ ] Kiro asks whether you want AI descriptions, then asks which AWS profile (names listed, "none" offered) and which region. It does not pick one.
+- [ ] `.env` gets only `DESCRIBE_AWS_PROFILE` and `DESCRIBE_REGION`; `.env.example` has both, empty.
+- [ ] `bun run describe -- --dry-run` prints the text for each failed row and calls nothing.
+- [ ] With `DESCRIBE_AWS_PROFILE` unset, `bun run describe` prints "No AWS profile set. Nothing was sent." and exits with code 1.
+- [ ] `bun run describe` writes `aiDescription` and `aiModel` to `results.json`, sets `description by` to the model id in `results.csv`, and shows the AI text in `summary.html`. Statuses are unchanged.
 Heal (break one locator on purpose, e.g. change a button name in a spec)
 - [ ] Healer fixes the locator only, then passes with `--repeat-each=3`.
 - [ ] Change an expected value in a spec: the healer asks you before changing it.
@@ -86,7 +103,7 @@ Heal (break one locator on purpose, e.g. change a button name in a spec)
 - Each run is saved to `reports/<YYYY-MM-DD_HH-mm-ss>/`, named with the machine's local time. Runs are kept until you delete them or set `REPORTS_KEEP`. Each run folder holds its own traces, so disk use grows with failures and retries.
 - The `report` script uses `ls` and `$(...)`, so it needs a Unix shell (macOS, Linux, Git Bash).
 - Chromium only, headless, for speed. Add browser projects if you need cross-browser coverage.
-- Node 20.12+ (for `process.loadEnvFile`, so no dotenv dependency). The only added runtime dependency is `csv-parse` (MIT).
+- Node 20.12+ (for `process.loadEnvFile`, so no dotenv dependency). The only added runtime dependency is `csv-parse` (MIT). The optional describe step adds the dev dependency `@aws/bedrock-token-generator` and needs the AWS CLI for `aws configure list-profiles`.
 - The Power is in the legacy `POWER.md` + `steering/` format you asked for. Kiro's current docs recommend the Agent Plugins format (`plugin.json` + `skills/`) for new powers and state that `POWER.md` powers keep working. A legacy Power's MCP server is registered in the user-level `~/.kiro/settings/mcp.json` under the Powers section.
 - Commands use bun/bunx. `mcp.json` keeps `npx` exactly as Playwright generated it. `npx` resolves the project-local Playwright, so the MCP server matches the project's version.
 
